@@ -466,6 +466,104 @@ def api_packets():
     return Response(payload, mimetype="application/x-ndjson")
 
 
+_IQ_CAPTURE_MAX_SECONDS = 60
+
+# Only one capture may run at a time. Each holds a Flask worker for up to its
+# full duration, and concurrent captures would contend for both workers and
+# buffer bandwidth; a second request is rejected rather than queued.
+_iq_capture_lock = threading.Lock()
+
+
+def _samples_advanced(start: int, end: int, buf_size: int) -> int:
+    """Number of samples written from *start* to *end* in a circular buffer."""
+    if end >= start:
+        return end - start
+    return buf_size - start + end
+
+
+@app.route("/api/iq_capture", methods=["GET"])
+def api_iq_capture():
+    raw = flask_request.args.get("seconds")
+    if raw is None:
+        return jsonify(error="'seconds' query parameter is required"), 400
+    try:
+        seconds = int(raw)
+    except (ValueError, TypeError):
+        return jsonify(error="'seconds' must be an integer"), 400
+
+    if seconds < 1:
+        return jsonify(error="'seconds' must be >= 1"), 400
+
+    if seconds > _IQ_CAPTURE_MAX_SECONDS:
+        return jsonify(error=f"'seconds' must be <= {_IQ_CAPTURE_MAX_SECONDS}"), 400
+
+    if not _iq_capture_lock.acquire(blocking=False):
+        return jsonify(error="Another IQ capture is already in progress"), 409
+    try:
+        n_samples = seconds * config.SAMPLE_RATE
+        buf_size = config.IQ_BUFFER_SIZE
+        chunk_n = buf_size // 2
+
+        # Copy straight into one pre-allocated array -- no intermediate chunk
+        # list or concatenate -- so peak memory is a single copy of the
+        # capture rather than several.
+        segment = np.empty(n_samples, dtype=np.complex64)
+        filled = 0
+        chunk_start = int(state.buf_write_idx)
+
+        while filled < n_samples:
+            this_n = min(chunk_n, n_samples - filled)
+            deadline = time.monotonic() + (this_n / config.SAMPLE_RATE) + 5.0
+
+            while _samples_advanced(chunk_start, int(state.buf_write_idx),
+                                    buf_size) < this_n:
+                if time.monotonic() > deadline:
+                    return jsonify(
+                        error="Timed out waiting for IQ samples from SDR"), 504
+                time.sleep(0.05)
+
+            e = (chunk_start + this_n) % buf_size
+            if chunk_start < e:
+                segment[filled:filled + this_n] = state.iq_buffer[chunk_start:e]
+            else:
+                n1 = buf_size - chunk_start
+                segment[filled:filled + n1] = state.iq_buffer[chunk_start:]
+                segment[filled + n1:filled + this_n] = state.iq_buffer[:e]
+
+            # Integrity guard: the region [chunk_start, +this_n) is read lock-
+            # free while the RX keeps writing. The RX only overwrites
+            # chunk_start after its write index laps a full buffer past it; if
+            # the copy stalled that long, the head is now < this_n ahead of
+            # chunk_start (it wrapped past it) and the samples are corrupt.
+            if _samples_advanced(chunk_start, int(state.buf_write_idx),
+                                 buf_size) < this_n:
+                return jsonify(
+                    error="SDR overran the capture buffer (host too slow); "
+                          "capture aborted"), 500
+
+            chunk_start = e
+            filled += this_n
+
+        buf = io.BytesIO()
+        np.save(buf, segment)
+        buf.seek(0)
+
+        fname = f"iq_{int(time.time())}_{seconds}s.npy"
+        resp = send_file(
+            buf,
+            mimetype="application/octet-stream",
+            as_attachment=True,
+            download_name=fname,
+        )
+        resp.headers["X-Sample-Rate-Hz"] = str(config.SAMPLE_RATE)
+        resp.headers["X-Center-Freq-Hz"] = str(int(state.lo_freq_hz))
+        resp.headers["X-Duration-S"] = str(seconds)
+        resp.headers["X-N-Samples"] = str(int(len(segment)))
+        return resp
+    finally:
+        _iq_capture_lock.release()
+
+
 # ===========================================================================
 # TX API routes
 # ===========================================================================
