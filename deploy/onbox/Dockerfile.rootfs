@@ -1,0 +1,56 @@
+# Debian armhf (arm/v7) rootfs for the on-box decoder (Pluto+ / Zynq-7010).
+#
+# Built under qemu emulation (linux/arm/v7) and exported as an ext4 rootfs for
+# the SD card. Carries the full decode stack via Debian apt (numpy 2.x / scipy
+# / opencv / libiio 0.26 — libiio matches the Pluto firmware) plus our pip
+# packages. DASHBOARD_MODE=packets_only means matplotlib/Pillow are NOT needed.
+#
+# Build (from repo root):
+#   docker build --platform linux/arm/v7 -f deploy/onbox/Dockerfile.rootfs -t sdr-onbox-rootfs .
+# Export rootfs tarball:
+#   deploy/onbox/build-rootfs.sh
+#
+# apt installs are split into small layers so a flaky mirror fetch only retries
+# the failing layer on rebuild (Docker caches the successful ones).
+
+FROM --platform=linux/arm/v7 debian:trixie-slim
+
+# Robust apt: retry truncated transfers, disable pipelining (flaky CDNs).
+RUN printf 'Acquire::Retries "10";\nAcquire::http::Pipeline-Depth "0";\nAcquire::http::No-Cache "true";\n' \
+    > /etc/apt/apt.conf.d/99robust
+RUN apt-get update
+
+# --- core python ---
+RUN apt-get install -y --no-install-recommends python3 python3-pip python3-venv ca-certificates
+
+# --- numerical stack (heavy; opencv pulls the largest dep closure) ---
+RUN apt-get install -y --no-install-recommends python3-numpy python3-scipy
+RUN apt-get install -y --no-install-recommends python3-opencv
+
+# --- web + SDR access (libiio 0.26 matches Pluto firmware) ---
+RUN apt-get install -y --no-install-recommends python3-flask
+RUN apt-get install -y --no-install-recommends python3-libiio libiio-utils libad9361-0
+
+# --- pure-python pip deps + decoder (apt provides numpy/scipy/cv2/iio) ---
+# --no-deps so pip never tries to pull a numpy that conflicts with apt's.
+RUN pip install --break-system-packages --no-deps \
+        reedsolo pyadi-iio "hubble-satnet-decoder>=1.1.1"
+
+# --- our application ---
+COPY pyproject.toml README.md LICENSE /opt/sdr-docker/
+COPY src /opt/sdr-docker/src
+RUN pip install --break-system-packages --no-deps /opt/sdr-docker
+
+# On-box defaults (overridable via systemd unit / env).
+ENV RX_BACKEND=libiio_local \
+    DEPLOYMENT=onbox \
+    DASHBOARD_MODE=packets_only \
+    LIBIIO_URI=local:
+
+# Smoke check: the whole decode stack imports under numpy 2.x.
+RUN python3 -c "import numpy, scipy, cv2, iio, flask; \
+import hubble_satnet_decoder; from hubble_satnet_decoder import decode_signal; \
+import stream_web.config, stream_web.libiio_rx, stream_web.processor; \
+print('on-box stack import OK; numpy', numpy.__version__)"
+
+CMD ["python3", "-c", "import stream_web.app as a; a.main()"]

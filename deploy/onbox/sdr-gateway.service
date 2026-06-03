@@ -1,0 +1,25 @@
+[Unit]
+Description=Hubble SDR on-box decoder gateway
+After=network.target
+# Wait for the local IIO device (AD936x) to be present.
+Wants=network.target
+
+[Service]
+Type=simple
+# On-box defaults; override here or in /etc/default/sdr-gateway as needed.
+Environment=RX_BACKEND=libiio_local
+Environment=DEPLOYMENT=onbox
+Environment=DASHBOARD_MODE=packets_only
+Environment=LIBIIO_URI=local:
+EnvironmentFile=-/etc/default/sdr-gateway
+ExecStart=/usr/bin/python3 -c "import stream_web.app as a; a.main()"
+# Mirrors the host path's connection-recovery model: libiio cannot recover an
+# IIO context in-process, so rx_loop exits (code 3) on connection loss and we
+# restart a clean instance.
+Restart=always
+RestartSec=5
+# Keep RSS visible / bounded on 512 MB hardware (soft guard, tune in M4).
+# MemoryMax=384M
+
+[Install]
+WantedBy=multi-user.target
