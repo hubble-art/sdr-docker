@@ -29,17 +29,17 @@ from hubble_satnet_decoder import reset_chipset_stats
 from . import config
 from .processor import processor_main
 
-# GNU Radio imports — deferred so the app can be imported without GNU Radio
-# installed (e.g. SDR_TYPE=mock, CI tests).
+# TX imports — deferred so the app can be imported without GNU Radio
+# installed (e.g. SDR_TYPE=mock, CI tests).  The RX backend is resolved at
+# startup via make_rx_backend() (also lazily imported), so no top-level RX
+# import is needed here.
 try:
     from .gnuradio_tx import TX_SOURCE_DIR, TXFlowgraph
-    from .sdr import rx_loop
 except ImportError:
     TX_SOURCE_DIR = os.environ.get(
         "TX_SOURCE_DIR", os.path.join(os.path.dirname(__file__), "source_files")
     )
     TXFlowgraph = None  # type: ignore[assignment,misc]
-    rx_loop = None  # type: ignore[assignment]
 
 # ===========================================================================
 # Shared application state
@@ -309,6 +309,9 @@ def api_status():
             chipset_stats=cs_stats,
             known_chipsets=sorted(config.SYNTH_RES.keys()),
             lo_freq_hz=state.lo_freq_hz,
+            deployment=config.DEPLOYMENT,
+            backend=config.RX_BACKEND,
+            dashboard_mode=config.DASHBOARD_MODE,
         )
 
 
@@ -699,9 +702,11 @@ def main():
         )
         proc.start()
 
+        from .rx_backend import make_rx_backend
+        rx_loop = make_rx_backend()
         threading.Thread(target=rx_loop, args=(state,), daemon=True).start()
         threading.Thread(target=_drain_results, args=(state,), daemon=True).start()
-        print("[main] RX thread + processor process started.")
+        print(f"[main] RX thread ({config.RX_BACKEND}) + processor process started.")
 
     print(f"[main] Open http://localhost:{config.FLASK_PORT} in a browser.")
 

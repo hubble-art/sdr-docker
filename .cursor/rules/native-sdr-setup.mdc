@@ -31,9 +31,28 @@ python3 -m venv --system-site-packages .venv
 
 If the venv already exists without `--system-site-packages`, either recreate it or add a `.pth` file pointing to the system `site-packages` (see README troubleshooting).
 
-## Do not modify `sdr.py` or `gnuradio_rx.py`
+## RX backends: host (GNU Radio/SoapySDR) vs on-box (pyadi-iio)
 
-`sdr.py` is a thin shim that re-exports `rx_loop` from `gnuradio_rx.py`. The GNU Radio + SoapySDR backend is the **only** supported SDR path. Do not add `pyadi-iio` fallbacks or rewrite these files — fix the system-level SoapySDR/libiio installation instead.
+There are now **two** sanctioned RX backends, selected at runtime by
+`config.RX_BACKEND` (see `src/stream_web/rx_backend.py`):
+
+- **`gnuradio_soapy`** — the default **host-mode** path: a host machine talks
+  to the SDR over USB/Ethernet via GNU Radio's `gr-soapy`. Implemented in
+  `gnuradio_rx.py` and re-exported by the `sdr.py` shim.
+- **`libiio_local`** — the **on-box** path: `sdr-docker` runs natively on the
+  SDR's own Linux (e.g. Pluto+ Zynq-7010) and captures via `pyadi-iio` against
+  the local IIO context. Implemented in `libiio_rx.py`. See
+  `docs/design/2026-06-03-onbox-decoder.md`.
+
+Rules:
+
+- **Do not modify `sdr.py` or `gnuradio_rx.py`** as a way to work around a
+  broken host SoapySDR/libiio install. On the **host**, GNU Radio + SoapySDR
+  is the only supported path — do **not** bolt a `pyadi-iio` fallback onto the
+  host path; fix the system-level SoapySDR/libiio installation instead.
+- The on-box `pyadi-iio` path is a **separate, deliberate backend** in its own
+  `libiio_rx.py` file for the on-device deployment target. It is **not** a host
+  fallback. Keep host-mode behavior byte-for-byte unchanged.
 
 ## Linux: system packages cover libiio and libad9361
 

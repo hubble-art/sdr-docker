@@ -59,6 +59,45 @@ from hubble_satnet_decoder.constants import (  # noqa: F401 — re-exported
 # "pluto" (ADALM-PLUTO & PlutoPlus) or "bladerf"
 SDR_TYPE = os.environ.get("SDR_TYPE", "pluto").lower()
 
+
+def _on_pluto() -> bool:
+    """Best-effort detection of running natively on a Pluto-class device.
+
+    True when a local IIO device exposes the AD936x phy driver.  Used only to
+    pick a sensible *default* backend; always overridable via ``RX_BACKEND``.
+    """
+    try:
+        for dev in ("iio:device0", "iio:device1", "iio:device2"):
+            name_path = f"/sys/bus/iio/devices/{dev}/name"
+            try:
+                with open(name_path) as f:
+                    if "ad9361" in f.read().strip():
+                        return True
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+# -- RX backend & deployment mode -------------------------------------------
+# "gnuradio_soapy" (host, default) or "libiio_local" (on-box, e.g. Pluto+).
+RX_BACKEND = os.environ.get(
+    "RX_BACKEND", "libiio_local" if _on_pluto() else "gnuradio_soapy"
+).lower()
+
+# Deployment label surfaced in /api/status. Derived from RX_BACKEND but
+# overridable for clarity in mixed setups.
+DEPLOYMENT = os.environ.get(
+    "DEPLOYMENT", "onbox" if RX_BACKEND == "libiio_local" else "host"
+).lower()
+
+# "full" (spectrogram + time-domain dashboard) or "packets_only" (no image
+# rendering — saves matplotlib/Pillow/CPU/RAM on constrained on-box hardware).
+DASHBOARD_MODE = os.environ.get(
+    "DASHBOARD_MODE", "packets_only" if DEPLOYMENT == "onbox" else "full"
+).lower()
+
 # -- PlutoSDR connection (ignored when SDR_TYPE != "pluto") -----------------
 PLUTO_URI = os.environ.get("PLUTO_URI", "ip:192.168.2.1")
 
