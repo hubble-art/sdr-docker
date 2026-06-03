@@ -33,16 +33,11 @@ class TestResolveBackendName:
 
 class TestMakeRxBackend:
     def test_libiio_dispatch_returns_callable(self):
-        # libiio stub imports cleanly (no adi import at module load) and is the
-        # entry point the factory should hand back for on-box mode.
+        # libiio backend imports cleanly (no adi import at module load) and is
+        # the entry point the factory should hand back for on-box mode.
         from stream_web import libiio_rx
         rx_loop = rx_backend.make_rx_backend("libiio_local")
         assert rx_loop is libiio_rx.rx_loop
-
-    def test_libiio_stub_not_yet_implemented(self):
-        rx_loop = rx_backend.make_rx_backend("libiio_local")
-        with pytest.raises(NotImplementedError, match="M2 milestone"):
-            rx_loop(None)
 
     def test_unknown_backend_raises(self):
         with pytest.raises(ValueError, match="Unknown RX_BACKEND"):

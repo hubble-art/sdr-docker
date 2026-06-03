@@ -32,6 +32,12 @@ dev = [
     "pytest-cov",
     "ruff",
 ]
+# On-box deployment (libiio_local backend): capture via pyadi-iio against the
+# SDR's local IIO context. Not needed for host mode (GNU Radio / gr-soapy).
+onbox = [
+    "pyadi-iio>=0.0.16",
+    "pylibiio>=0.23",
+]
 
 # ---- Hatchling build config (src layout) ----
 [tool.hatch.build.targets.wheel]
