@@ -16,7 +16,11 @@ import numpy as np
 from hubble_satnet_decoder import compute_spec_chunk, decode_signal, get_chipset_stats
 
 from . import config
-from .spectrogram import render_spec_image, render_td_plot
+
+# Spectrogram / time-domain rendering pulls in matplotlib + Pillow. On
+# constrained on-box hardware we run DASHBOARD_MODE="packets_only" and skip
+# both the import and the per-cycle render work. Imported lazily in
+# processor_main so the heavy deps are never loaded in packets_only mode.
 
 
 def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
@@ -34,7 +38,13 @@ def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
 
     buf_len = config.IQ_BUFFER_SIZE
 
-    print("[PROC] Processor process started (separate GIL).", flush=True)
+    full_dashboard = config.DASHBOARD_MODE == "full"
+    render_spec_image = render_td_plot = None
+    if full_dashboard:
+        from .spectrogram import render_spec_image, render_td_plot
+
+    print(f"[PROC] Processor process started (separate GIL, "
+          f"dashboard={config.DASHBOARD_MODE}).", flush=True)
 
     while running_event.is_set():
         t0 = time.perf_counter()
@@ -67,14 +77,15 @@ def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
                 return iq_buffer[start:widx].copy()
             return np.concatenate([iq_buffer[start:], iq_buffer[:widx]])
 
-        # 1) Spectrogram
+        # 1) Spectrogram (skipped in packets_only mode)
         t_spec0 = time.perf_counter()
-        spec_chunk_iq = _extract_last(config.SPEC_CHUNK_SAMPLES)
-        try:
-            sxx_chunk = compute_spec_chunk(spec_chunk_iq)
-            spec_chunks.append(sxx_chunk)
-        except Exception as e:
-            print(f"[PROC] Spec error: {e}")
+        if full_dashboard:
+            spec_chunk_iq = _extract_last(config.SPEC_CHUNK_SAMPLES)
+            try:
+                sxx_chunk = compute_spec_chunk(spec_chunk_iq)
+                spec_chunks.append(sxx_chunk)
+            except Exception as e:
+                print(f"[PROC] Spec error: {e}")
         t_spec_ms = (time.perf_counter() - t_spec0) * 1000
 
         # 2) Decode
@@ -105,40 +116,42 @@ def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
                             att["reason"] = "sample_drop"
                         break
 
-        # 3) Detection history (process-local)
-        for d in detection_history:
-            d["offset_from_right"] += config.SPEC_CHUNK_S
-        detection_history = [
-            d for d in detection_history
-            if d["offset_from_right"] <= config.SPEC_DURATION_S
-        ]
-        for det in detections:
-            new_offset = config.DECODE_WINDOW_S - det["time_s"]
-            is_dup = False
-            for existing in detection_history:
-                if (abs(existing["offset_from_right"] - new_offset) < 0.15
-                        and abs(existing["freq_hz"] - det.get("F0_hz", det["freq_hz"])) < 5000):
-                    is_dup = True
-                    break
-            if not is_dup:
-                detection_history.append({
-                    "offset_from_right": new_offset,
-                    "freq_hz": det.get("F0_hz", det["freq_hz"]),
-                    "phy_ver": det["phy_ver"],
-                    "signal_duration_s": det.get(
-                        "signal_duration_s",
-                        det.get("preamble_duration_s", 0.05),
-                    ),
-                    "chipset": det.get("chipset", "v-1"),
-                })
+        # 3) Detection history (process-local) — only used for the spec image
+        if full_dashboard:
+            for d in detection_history:
+                d["offset_from_right"] += config.SPEC_CHUNK_S
+            detection_history = [
+                d for d in detection_history
+                if d["offset_from_right"] <= config.SPEC_DURATION_S
+            ]
+            for det in detections:
+                new_offset = config.DECODE_WINDOW_S - det["time_s"]
+                is_dup = False
+                for existing in detection_history:
+                    if (abs(existing["offset_from_right"] - new_offset) < 0.15
+                            and abs(existing["freq_hz"] - det.get("F0_hz", det["freq_hz"])) < 5000):
+                        is_dup = True
+                        break
+                if not is_dup:
+                    detection_history.append({
+                        "offset_from_right": new_offset,
+                        "freq_hz": det.get("F0_hz", det["freq_hz"]),
+                        "phy_ver": det["phy_ver"],
+                        "signal_duration_s": det.get(
+                            "signal_duration_s",
+                            det.get("preamble_duration_s", 0.05),
+                        ),
+                        "chipset": det.get("chipset", "v-1"),
+                    })
 
-        # 4) Render spectrogram
+        # 4) Render spectrogram (skipped in packets_only mode)
         t_render0 = time.perf_counter()
         img_bytes = b""
-        try:
-            img_bytes = render_spec_image(list(spec_chunks), detection_history)
-        except Exception as e:
-            print(f"[PROC] Render error: {e}")
+        if full_dashboard:
+            try:
+                img_bytes = render_spec_image(list(spec_chunks), detection_history)
+            except Exception as e:
+                print(f"[PROC] Render error: {e}")
         t_render_ms = (time.perf_counter() - t_render0) * 1000
 
         dt_ms = (time.perf_counter() - t0) * 1000
@@ -186,7 +199,7 @@ def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
         td_decode_info_out = None
         td_iq_seg_out = None
 
-        td_on = bool(td_running_val.value)
+        td_on = full_dashboard and bool(td_running_val.value)
         td_chipset_raw = td_chipset_arr.value
         td_chipset = td_chipset_raw.decode() if td_chipset_raw else None
         td_ntw_id = td_ntw_id_val.value if td_has_ntw_val.value else None
