@@ -1,0 +1,28 @@
+# u-boot environment for booting the on-box decoder from microSD.
+#
+# Goal: skip the firmware ramdisk and boot STRAIGHT into the Debian armhf rootfs
+# on the SD card's second partition (ext4). systemd (PID 1) then starts
+# sdr-gateway.service. No switch_root needed when u-boot can set root= itself.
+#
+# Requires a u-boot built with SD-boot support (plutosdr-fw u-boot + the
+# zynq-common.h "sdboot" patch from plutoplus issue #35). Place this file +
+# BOOT.bin + the kernel + devicetree on the FAT32 boot partition.
+#
+# Adjust kernel_image / devicetree_image to match the artifacts you ship.
+
+kernel_image=uImage
+devicetree_image=system.dtb
+fit_load_address=0x2080000
+devicetree_load_address=0x2000000
+
+# Boot directly to the ext4 rootfs on mmcblk0p2.
+bootargs=console=ttyPS0,115200 root=/dev/mmcblk0p2 rootfstype=ext4 rw rootwait earlyprintk
+
+sdboot=if mmcinfo; then \
+  echo Loading kernel + dtb from SD...; \
+  load mmc 0 ${fit_load_address} ${kernel_image} && \
+  load mmc 0 ${devicetree_load_address} ${devicetree_image} && \
+  bootm ${fit_load_address} - ${devicetree_load_address}; \
+fi
+
+uenvcmd=run sdboot

@@ -41,22 +41,56 @@ libiio + pip pyadi-iio/reedsolo/hubble-satnet-decoder + sdr-docker) and exports
 the filesystem as `rootfs.tar`. The image's build-time smoke check imports the
 full decode stack under numpy 2.x.
 
-### Stage 2 — boot chain (board-matched; in progress)
+### Target board (confirmed)
 
-Reuse this board's working kernel + a small initramfs whose `init` mounts the
-SD ext4 rootfs and `switch_root`s into it. Copy the firmware's matching
-`/lib/modules/<kver>` into the rootfs so kernel modules line up.
+HamGeek **ADI Pluto+** clone: Zynq-7010, 512 MB, AD936x, Gigabit Ethernet +
+microSD. Reports `Analog Devices PlutoSDR Rev.C (Z7010-AD9363A)`, fw
+`v0.37-dirty`, kernel `5.10.0 SMP armv7l`. Firmware lineage =
+[`plutoplus/plutoplus`](https://github.com/plutoplus/plutoplus) family.
+**Do NOT use ANTSDR/E310 or LibreSDR (Zynq-7020) artifacts — wrong board.**
 
-> The exact `BOOT.bin` / kernel / devicetree must match this specific Pluto+
-> clone (it reports `PlutoSDR Rev.C`, fw `v0.37-dirty`, kernel 5.10.0 SMP).
-> Do NOT use ANTSDR artifacts — different board.
+### Stage 2 — boot chain (blocked on `BOOT.bin`)
+
+`deploy/onbox/boot/` holds the board-agnostic pieces:
+
+- `uEnv.txt` — boots straight into the SD ext4 rootfs (`root=/dev/mmcblk0p2`),
+  systemd then starts the gateway. Preferred (no ramdisk / `switch_root`).
+- `initramfs-init.sh` — fallback `switch_root` init if u-boot can't set `root=`.
+
+The **one missing piece is a Pluto+ `BOOT.bin` (FSBL + u-boot + bitstream) with
+SD-boot support**, plus a matching kernel (`uImage`), `devicetree.dtb`, and the
+firmware's `/lib/modules/<kver>` copied into the rootfs. No maintained turnkey
+SD-boot firmware exists for this clone (plutoplus's only release can't read the
+SD card), so `BOOT.bin` must come from one of:
+
+1. **Clone the running unit (preferred):** SSH in and pull its kernel,
+   `/lib/modules`, devicetree, and u-boot env (`fw_printenv`); the device
+   already boots fine, so we replicate that to SD. *(Blocked: SSH password —
+   `root`/`analog` was rejected on this unit.)* Also check for a firmware
+   startup hook that could pivot into the SD rootfs **without** reflashing the
+   boot chain or setting the jumper.
+2. **Build it:** `plutosdr-fw` u-boot + the `zynq-common.h` `sdboot` patch
+   (plutoplus issue #35), built with Xilinx Vivado. Heavy; needs Vivado.
+3. **Vendor image:** a HamGeek-provided SD/firmware image, if available.
 
 ### Stage 3 — write the SD card and boot
 
-1. Partition the microSD: `p1` FAT32 (boot, ~256 MB), `p2` ext4 (rootfs, rest).
-2. Copy boot artifacts → FAT32; extract `rootfs.tar` → ext4.
-3. Set the **SD-H jumper** on the PCB (SD boot; physical step).
-4. Insert card, power on. The gateway comes up on the device IP, port 8050.
+`deploy/onbox/provision-sd.sh` partitions + populates the card (p1 FAT32 boot,
+p2 ext4 rootfs from `out/rootfs.tar`, installs the systemd unit). It is
+**dry-run by default**, refuses non-removable/oversized/system disks, and needs
+`--commit` + typed confirmation. Run on Linux (ext4 isn't native on macOS).
+
+```bash
+deploy/onbox/provision-sd.sh /dev/sdX            # preview
+deploy/onbox/provision-sd.sh /dev/sdX --commit   # erase + write
+```
+
+Then copy the Stage 2 artifacts (`BOOT.bin`, kernel, devicetree) onto the FAT32
+partition and the firmware's `/lib/modules/<kver>` into the rootfs. Finally:
+
+1. Set the **SD-H jumper** on the PCB (SD boot; physical step) — unless a
+   firmware startup hook lets us avoid it.
+2. Insert card, power on. The gateway comes up on the device IP, port 8050.
 
 ```bash
 curl http://<device-ip>:8050/api/status     # deployment=onbox, backend=libiio_local
