@@ -49,48 +49,61 @@ microSD. Reports `Analog Devices PlutoSDR Rev.C (Z7010-AD9363A)`, fw
 [`plutoplus/plutoplus`](https://github.com/plutoplus/plutoplus) family.
 **Do NOT use ANTSDR/E310 or LibreSDR (Zynq-7020) artifacts — wrong board.**
 
-### Stage 2 — boot chain (blocked on `BOOT.bin`)
+### Device facts (from the running unit over SSH)
 
-`deploy/onbox/boot/` holds the board-agnostic pieces:
+Login: **`root` / `root`** (this HamGeek v0.37-dirty build uses `root`, not the
+usual `analog`). Inspection revealed why the chroot path below is the right one:
 
-- `uEnv.txt` — boots straight into the SD ext4 rootfs (`root=/dev/mmcblk0p2`),
-  systemd then starts the gateway. Preferred (no ramdisk / `switch_root`).
-- `initramfs-init.sh` — fallback `switch_root` init if u-boot can't set `root=`.
+- **Monolithic kernel, zero loadable modules** (`/lib/modules` empty). AD9361 /
+  IIO / SD (`sdhci-of-arasan`) / ext4 / vfat are all built in — the rootfs needs
+  **no** matching `/lib/modules`.
+- **`/etc/init.d/S98autostart` sources `/mnt/jffs2/autorun.sh`** if present —
+  a supported, persistent, reversible boot hook in QSPI flash.
+- u-boot has SD-boot, but it's gated on `modeboot=sdboot` (the jumper).
 
-The **one missing piece is a Pluto+ `BOOT.bin` (FSBL + u-boot + bitstream) with
-SD-boot support**, plus a matching kernel (`uImage`), `devicetree.dtb`, and the
-firmware's `/lib/modules/<kver>` copied into the rootfs. No maintained turnkey
-SD-boot firmware exists for this clone (plutoplus's only release can't read the
-SD card), so `BOOT.bin` must come from one of:
+### Stage 2 — deployment via chroot hook (PRIMARY, no jumper, reversible)
 
-1. **Clone the running unit (preferred):** SSH in and pull its kernel,
-   `/lib/modules`, devicetree, and u-boot env (`fw_printenv`); the device
-   already boots fine, so we replicate that to SD. *(Blocked: SSH password —
-   `root`/`analog` was rejected on this unit.)* Also check for a firmware
-   startup hook that could pivot into the SD rootfs **without** reflashing the
-   boot chain or setting the jumper.
-2. **Build it:** `plutosdr-fw` u-boot + the `zynq-common.h` `sdboot` patch
-   (plutoplus issue #35), built with Xilinx Vivado. Heavy; needs Vivado.
-3. **Vendor image:** a HamGeek-provided SD/firmware image, if available.
+Because the stock kernel already provides every driver, we **leave QSPI boot
+completely untouched** and run the gateway from the SD rootfs via the autorun
+hook:
 
-### Stage 3 — write the SD card and boot
+1. `autorun.sh` (installed to `/mnt/jffs2/autorun.sh`) mounts the SD's ext4
+   rootfs, bind-mounts `/dev` + `/sys` + `/proc` (so `libiio local:` sees the
+   live IIO devices), and `chroot`s in to launch the gateway on port 8050.
+2. To revert: delete `/mnt/jffs2/autorun.sh` and reboot — pure stock firmware.
 
-`deploy/onbox/provision-sd.sh` partitions + populates the card (p1 FAT32 boot,
-p2 ext4 rootfs from `out/rootfs.tar`, installs the systemd unit). It is
-**dry-run by default**, refuses non-removable/oversized/system disks, and needs
-`--commit` + typed confirmation. Run on Linux (ext4 isn't native on macOS).
+No `BOOT.bin`, no `switch_root`, no boot-chain risk, no SD-H jumper.
+
+> The `boot/` dir (`uEnv.txt`, `initramfs-init.sh`) and `provision-sd.sh` remain
+> as the **alternative full-SD-boot path** (replace the rootfs entirely, needs a
+> Pluto+ `BOOT.bin` + jumper). Not needed for the chroot path.
+
+### Stage 3 — build + flash the SD, install the hook
 
 ```bash
-deploy/onbox/provision-sd.sh /dev/sdX            # preview
-deploy/onbox/provision-sd.sh /dev/sdX --commit   # erase + write
+deploy/onbox/build-rootfs.sh        # -> out/rootfs.tar (Stage 1)
+deploy/onbox/build-sdimg.sh         # -> out/sdcard.img (ext4, populated)
+
+# Flash (macOS — VERIFY the disk number first; this erases it):
+diskutil list
+diskutil unmountDisk /dev/disk5
+sudo dd if=deploy/onbox/out/sdcard.img of=/dev/rdisk5 bs=4m && sync
+
+# Install the persistent hook on the Pluto (over SSH, root/root):
+scp deploy/onbox/autorun.sh root@192.168.2.1:/mnt/jffs2/autorun.sh
+ssh root@192.168.2.1 chmod +x /mnt/jffs2/autorun.sh
 ```
 
-Then copy the Stage 2 artifacts (`BOOT.bin`, kernel, devicetree) onto the FAT32
-partition and the firmware's `/lib/modules/<kver>` into the rootfs. Finally:
+Then move the SD card into the Pluto+ and reboot. The gateway comes up on the
+device IP, port 8050:
 
-1. Set the **SD-H jumper** on the PCB (SD boot; physical step) — unless a
-   firmware startup hook lets us avoid it.
-2. Insert card, power on. The gateway comes up on the device IP, port 8050.
+```bash
+curl http://192.168.2.1:8050/api/status     # deployment=onbox, backend=libiio_local
+curl http://192.168.2.1:8050/api/packets    # NDJSON decode stream
+```
+
+The ext4 image defaults to 6 GiB; grow it to fill the card later with
+`resize2fs` if you want more space for logs / IQ captures.
 
 ```bash
 curl http://<device-ip>:8050/api/status     # deployment=onbox, backend=libiio_local
