@@ -79,6 +79,66 @@ Suggested order on Ubuntu:
 > Reminder: keep `numpy>=1.26,<2`. GNU Radio (apt + Homebrew) is built against
 > NumPy 1.x; relaxing this breaks `import gnuradio` with `_ARRAY_API not found`.
 
+## 2a. Working with the STOCK `hubble-satnet-decoder` — what to patch
+
+**`sdr-docker` does NOT fork the decoder.** It installs the stock package from
+PyPI (`hubble-satnet-decoder>=1.1.1`) and **reconfigures it at runtime**. If you
+clone the upstream decoder repo to work on it, you must know the following or
+results will silently be wrong.
+
+### (a) Version floor — correct synthesizer frequencies live in ≥ 1.1.1
+`pyproject.toml` pins `hubble-satnet-decoder>=1.1.1`. **Do not** use an older
+release: 1.1.1 carries the corrected `SYNTH_RES` (chipset symbol rates), namely
+`ti=366.2119, nordic=488.28125, silabs=296.0, esp=400.0, atmosic=500.0`.
+Earlier versions have wrong frequencies and will mis-decode. If you build/install
+from the upstream repo, make sure the checkout is at **≥ v1.1.1**.
+
+### (b) Mandatory runtime reconfiguration (the real "patch")
+The decoder ships with default constants. `src/stream_web/config.py` (lines
+~146–154) overrides them **at import time** to match this SDR front-end:
+
+```python
+import hubble_satnet_decoder.constants as _fdc
+_fdc.CHANNEL_SPACING = 25_750.0
+_fdc.DEVICE_CHANNEL_SPACING = {
+    name: round(_fdc.CHANNEL_SPACING / sr) * sr
+    for name, sr in _fdc.SYNTH_RES.items()
+}
+_fdc.configure(781_250)          # SAMPLE_RATE: 6.25 MHz / 8
+```
+
+Any standalone test of the **stock** decoder (outside `sdr-docker`) must
+replicate this, or it will use different channelization / sample rate. The
+decoder contract is: `decode_signal(iq) -> (packets, detections, attempts)` on a
+**1 s complex64 chunk at 781.25 kS/s**; also `compute_spec_chunk`,
+`get_chipset_stats`. Preamble detection is an **OpenCV template match**.
+
+### (c) OpenCV dependency — the concrete patch point for on-box ARM
+The decoder `import cv2` for preamble template matching. On `armhf`/Debian, PyPI
+opencv wheels are unreliable. Order of preference:
+1. apt `python3-opencv` (used in `deploy/onbox/Dockerfile.rootfs`);
+2. if that fails on the chosen Debian release, **vendor a thin NumPy/SciPy
+   replacement of just the template-match call site** upstream in the decoder
+   (this is the one place you may need to actually edit the decoder source).
+Host (x86) is fine with `opencv-python-headless` from pip.
+
+### (d) Performance: C-ports go UPSTREAM in the decoder repo, not here
+If the Zynq dual Cortex-A9 can't decode in real time (likely the main risk),
+the plan (see `docs/design/2026-06-03-onbox-decoder.md` §5, §10) is:
+1. **Profile first** (`decode_signal` on a representative 1 s chunk).
+2. Loosen `DECODE_INTERVAL_S` as a cheap first lever.
+3. Only then **C-port the dominant hot loop in `hubble-satnet-decoder` itself**
+   (Cython/C extension), release a new version, and bump the pin here.
+**Do not add C code to `sdr-docker`** — keep it pure-Python so both host and
+on-box benefit and installs stay simple. So: yes, you will patch the *stock
+decoder repo* for perf — but as upstream changes + a version bump, not a fork.
+
+### (e) Summary for the next assistant
+- Install stock decoder ≥ 1.1.1 from PyPI; don't fork for normal use.
+- Always apply the `config.py` runtime reconfig (CHANNEL_SPACING + `configure()`).
+- For on-box ARM: replace opencv with apt (or vendor the template-match site).
+- For speed: profile, then C-port hot loops **in the decoder repo** + bump pin.
+
 ## 3. Pluto+ recovery (optional, when you want the 1 GB unit back)
 
 Everything is in `deploy/pluto-plus-recovery/` with its own README. Summary:
