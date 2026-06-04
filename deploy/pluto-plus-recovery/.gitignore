@@ -1,0 +1,6 @@
+# Fetched at recovery time (see fetch-bootstrap.sh); not source-controlled
+openocd/u-boot.elf
+openocd/ps7_init.tcl
+openocd/system_top.bit
+openocd/jtag-bs.zip
+openocd/run.tcl
