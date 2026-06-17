@@ -16,7 +16,7 @@ import numpy as np
 from hubble_satnet_decoder import compute_spec_chunk, decode_signal, get_chipset_stats
 
 from . import config
-from .spectrogram import render_spec_image, render_td_plot, render_symbol_zoom_plot
+from .spectrogram import render_spec_image, render_symbol_zoom_plot, render_td_plot
 
 
 def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,

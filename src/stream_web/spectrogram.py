@@ -9,7 +9,8 @@ import numpy as np  # noqa: E402
 from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
-from scipy.signal import spectrogram as scipy_spectrogram  # noqa: E402
+from scipy.signal import filtfilt  # noqa: E402
+from scipy.signal import spectrogram as scipy_spectrogram
 
 from . import config  # noqa: E402
 
@@ -175,6 +176,23 @@ def _draw_decoder_overlay(ax, decode_info: dict):
                 fontfamily="monospace", va="bottom", ha="left", alpha=1.0)
 
 
+def _build_crossings(iq_seg: np.ndarray, smoothing_window: int = 8):
+    """Compute global rising/falling threshold crossings for a segment.
+
+    Uses scipy filtfilt (zero-phase) and a 50%-of-90th-percentile threshold
+    for robustness against noise outliers.  Returns (rising, falling) arrays
+    of sample indices within iq_seg.
+    """
+    b = np.ones(smoothing_window) / smoothing_window
+    smoothed = filtfilt(b, [1], np.abs(iq_seg))
+    thresh = float(np.percentile(smoothed, 90)) * 0.5
+    above = (smoothed >= thresh).astype(np.int8)
+    d = np.diff(above)
+    rising = np.where(d > 0)[0]
+    falling = np.where(d < 0)[0]
+    return rising, falling
+
+
 def _measure_transition_us(
     iq_seg: np.ndarray,
     begin: int,
@@ -189,7 +207,8 @@ def _measure_transition_us(
     if end - begin < smoothing_window * 2:
         return None
     magnitude = np.abs(iq_seg[begin:end])
-    smoothed = np.convolve(magnitude, np.ones(smoothing_window) / smoothing_window, mode="same")
+    b = np.ones(smoothing_window) / smoothing_window
+    smoothed = filtfilt(b, [1], magnitude)
     lo = float(smoothed.min())
     hi = float(smoothed.max())
     if hi - lo < 1e-9:
@@ -253,17 +272,55 @@ def render_symbol_zoom_plot(
     mag = np.abs(zoom_seg)
     mag_dbfs = 20.0 * np.log10(np.clip(mag, 1e-12, None) / config.ADC_FULL_SCALE)
 
-    # Per-symbol rise/fall measurements
+    # Per-symbol rise/fall measurements — global crossings + chaining
+    gap_samples = slot - sym_len
+    search_margin = max(gap_samples, sym_len // 8)
+    fall_margin = gap_samples // 4
+
+    rising_xings, falling_xings = _build_crossings(zoom_seg)
+
+    def _nearest_xing(arr, target):
+        if not len(arr):
+            return int(target)
+        return int(arr[np.argmin(np.abs(arr - target))])
+
     sym_infos = []
+    prev_end = None
     for k in range(n_sym):
         abs_start = start_sample + (sym_offset + k) * slot
-        s = abs_start - view_start  # relative to zoom_seg
-        e = s + sym_len
-        if s < 0 or e > n:
+        nom_s = abs_start - view_start
+        nom_e = nom_s + sym_len
+
+        if nom_s < 0 or nom_e > n:
             continue
-        quarter = sym_len // 4
-        rise_us = _measure_transition_us(zoom_seg, s - quarter, s + quarter, sr, rise=True)
-        fall_us = _measure_transition_us(zoom_seg, e - quarter, e + quarter, sr, rise=False)
+
+        # Chain from previous symbol end; fall back to nominal for the first symbol
+        search_center = (prev_end + gap_samples) if prev_end is not None else nom_s
+        rs_lo = max(search_center - search_margin, (prev_end + 1) if prev_end is not None else 0)
+        rs_hi = search_center + search_margin
+        cands = rising_xings[(rising_xings >= rs_lo) & (rising_xings <= rs_hi)]
+        if not len(cands):
+            rs_lo = max(nom_s - search_margin, (prev_end + 1) if prev_end is not None else 0)
+            rs_hi = nom_s + search_margin
+            cands = rising_xings[(rising_xings >= rs_lo) & (rising_xings <= rs_hi)]
+        s = _nearest_xing(cands, search_center)
+        if prev_end is not None:
+            s = max(s, prev_end + 1)
+
+        nom_e_corr = s + sym_len
+        fe_lo = max(0, nom_e_corr - fall_margin)
+        fe_hi = min(n, nom_e_corr + fall_margin)
+        cands = falling_xings[(falling_xings >= fe_lo) & (falling_xings <= fe_hi)]
+        e = _nearest_xing(cands, nom_e_corr)
+        e = max(e, s + 1)
+
+        s = max(0, min(s, n - 1))
+        e = max(s + 1, min(e, n))
+        prev_end = e
+
+        meas_margin = gap_samples // 2
+        rise_us = _measure_transition_us(zoom_seg, s - meas_margin, s + meas_margin, sr, rise=True)
+        fall_us = _measure_transition_us(zoom_seg, e - meas_margin, e + meas_margin, sr, rise=False)
         sym_infos.append({
             "preamble_idx": sym_offset + k,
             "s_us": s / sr * 1e6,
