@@ -9,10 +9,10 @@ import numpy as np  # noqa: E402
 from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
-from scipy.signal import filtfilt  # noqa: E402
-from scipy.signal import spectrogram as scipy_spectrogram
+from scipy.signal import spectrogram as scipy_spectrogram  # noqa: E402
 
 from . import config  # noqa: E402
+from .timing import correct_symbol_edges, measure_transition_us  # noqa: E402
 
 # -- Pre-computed LUT and font ----------------------------------------------
 
@@ -176,66 +176,6 @@ def _draw_decoder_overlay(ax, decode_info: dict):
                 fontfamily="monospace", va="bottom", ha="left", alpha=1.0)
 
 
-def _build_crossings(iq_seg: np.ndarray, smoothing_window: int = 8):
-    """Compute global rising/falling threshold crossings for a segment.
-
-    Uses scipy filtfilt (zero-phase) and a 50%-of-90th-percentile threshold
-    for robustness against noise outliers.  Returns (rising, falling) arrays
-    of sample indices within iq_seg.
-    """
-    b = np.ones(smoothing_window) / smoothing_window
-    smoothed = filtfilt(b, [1], np.abs(iq_seg))
-    thresh = float(np.percentile(smoothed, 90)) * 0.5
-    above = (smoothed >= thresh).astype(np.int8)
-    d = np.diff(above)
-    rising = np.where(d > 0)[0]
-    falling = np.where(d < 0)[0]
-    return rising, falling
-
-
-def _measure_transition_us(
-    iq_seg: np.ndarray,
-    begin: int,
-    end: int,
-    sr: int,
-    rise: bool,
-    smoothing_window: int = 32,
-) -> float | None:
-    """10%-90% rise or fall time in microseconds. Returns None if not measurable."""
-    begin = max(0, begin)
-    end = min(len(iq_seg), end)
-    if end - begin < smoothing_window * 2:
-        return None
-    magnitude = np.abs(iq_seg[begin:end])
-    b = np.ones(smoothing_window) / smoothing_window
-    smoothed = filtfilt(b, [1], magnitude)
-    lo = float(smoothed.min())
-    hi = float(smoothed.max())
-    if hi - lo < 1e-9:
-        return None
-    thresh_10 = lo + 0.10 * (hi - lo)
-    thresh_90 = lo + 0.90 * (hi - lo)
-    if rise:
-        hits_10 = np.where(smoothed > thresh_10)[0]
-        if not len(hits_10):
-            return None
-        i10 = int(hits_10[0])
-        hits_90 = np.where(smoothed[i10:] > thresh_90)[0]
-        if not len(hits_90):
-            return None
-        i90 = i10 + int(hits_90[0])
-    else:
-        hits_90 = np.where(smoothed < thresh_90)[0]
-        if not len(hits_90):
-            return None
-        i90 = int(hits_90[0])
-        hits_10 = np.where(smoothed[i90:] < thresh_10)[0]
-        if not len(hits_10):
-            return None
-        i10 = i90 + int(hits_10[0])
-    return abs(i10 - i90) / sr * 1e6
-
-
 def render_symbol_zoom_plot(
     iq_segment: np.ndarray,
     decode_info: dict | None = None,
@@ -252,10 +192,12 @@ def render_symbol_zoom_plot(
 
     start_sample = decode_info["start_sample"]
     n_sym = min(max(1, n_symbols), preamble_len)
-    sym_offset = preamble_len - n_sym  # first symbol index shown (0-based in preamble)
+    # Show the last n_sym symbols
+    sym_offset = preamble_len - n_sym
 
     first_sym_abs = start_sample + sym_offset * slot
     last_sym_end_abs = start_sample + preamble_len * slot
+    # Half-symbol margin on each side so edge transitions aren't clipped
     margin = sym_len // 2
 
     view_start = max(0, first_sym_abs - margin)
@@ -272,55 +214,20 @@ def render_symbol_zoom_plot(
     mag = np.abs(zoom_seg)
     mag_dbfs = 20.0 * np.log10(np.clip(mag, 1e-12, None) / config.ADC_FULL_SCALE)
 
-    # Per-symbol rise/fall measurements — global crossings + chaining
     gap_samples = slot - sym_len
-    search_margin = max(gap_samples, sym_len // 8)
-    fall_margin = gap_samples // 4
+    # Half the inter-symbol gap to center selected symbols
+    meas_margin = gap_samples // 2
 
-    rising_xings, falling_xings = _build_crossings(zoom_seg)
+    # Correct symbol positions using global envelope crossings + chaining
+    edges = correct_symbol_edges(
+        zoom_seg, start_sample, view_start, n_sym, sym_offset, slot, sym_len,
+    )
 
-    def _nearest_xing(arr, target):
-        if not len(arr):
-            return int(target)
-        return int(arr[np.argmin(np.abs(arr - target))])
-
+    # Measure 10%-90% rise/fall time at each corrected edge
     sym_infos = []
-    prev_end = None
-    for k in range(n_sym):
-        abs_start = start_sample + (sym_offset + k) * slot
-        nom_s = abs_start - view_start
-        nom_e = nom_s + sym_len
-
-        if nom_s < 0 or nom_e > n:
-            continue
-
-        # Chain from previous symbol end; fall back to nominal for the first symbol
-        search_center = (prev_end + gap_samples) if prev_end is not None else nom_s
-        rs_lo = max(search_center - search_margin, (prev_end + 1) if prev_end is not None else 0)
-        rs_hi = search_center + search_margin
-        cands = rising_xings[(rising_xings >= rs_lo) & (rising_xings <= rs_hi)]
-        if not len(cands):
-            rs_lo = max(nom_s - search_margin, (prev_end + 1) if prev_end is not None else 0)
-            rs_hi = nom_s + search_margin
-            cands = rising_xings[(rising_xings >= rs_lo) & (rising_xings <= rs_hi)]
-        s = _nearest_xing(cands, search_center)
-        if prev_end is not None:
-            s = max(s, prev_end + 1)
-
-        nom_e_corr = s + sym_len
-        fe_lo = max(0, nom_e_corr - fall_margin)
-        fe_hi = min(n, nom_e_corr + fall_margin)
-        cands = falling_xings[(falling_xings >= fe_lo) & (falling_xings <= fe_hi)]
-        e = _nearest_xing(cands, nom_e_corr)
-        e = max(e, s + 1)
-
-        s = max(0, min(s, n - 1))
-        e = max(s + 1, min(e, n))
-        prev_end = e
-
-        meas_margin = gap_samples // 2
-        rise_us = _measure_transition_us(zoom_seg, s - meas_margin, s + meas_margin, sr, rise=True)
-        fall_us = _measure_transition_us(zoom_seg, e - meas_margin, e + meas_margin, sr, rise=False)
+    for k, (s, e) in enumerate(edges):
+        rise_us = measure_transition_us(zoom_seg, s - meas_margin, s + meas_margin, sr, rise=True)
+        fall_us = measure_transition_us(zoom_seg, e - meas_margin, e + meas_margin, sr, rise=False)
         sym_infos.append({
             "preamble_idx": sym_offset + k,
             "s_us": s / sr * 1e6,
@@ -329,14 +236,17 @@ def render_symbol_zoom_plot(
             "fall_us": fall_us,
         })
 
+    # Layout - top is envelope magnitude, bottom is spectrogram (shared x-axis)
     fig = Figure(figsize=(12, 7), dpi=100, facecolor="#0f0f23")
     canvas = FigureCanvasAgg(fig)
     ax_td = fig.add_subplot(2, 1, 1)
     ax_sg = fig.add_subplot(2, 1, 2, sharex=ax_td)
 
+    # Show symbol edges at 0.5 at 80% opacity
     ax_td.set_facecolor("#1a1a2e")
     ax_td.plot(t_us, mag_dbfs, color="#7fdbca", linewidth=0.5, alpha=0.8)
 
+    # Floor is about 40 dBFS below symbol.
     sig_peak = float(np.max(mag_dbfs)) if len(mag_dbfs) else -10.0
     y_floor = max(-80.0, sig_peak - 40.0)
     ax_td.set_ylim(y_floor, 2.0)
@@ -344,10 +254,12 @@ def render_symbol_zoom_plot(
 
     for si in sym_infos:
         s_us, e_us = si["s_us"], si["e_us"]
+        # Shaded region shows the symbol body; vertical lines mark the edges
         ax_td.axvspan(s_us, e_us, alpha=0.10, color="#22d3ee")
         ax_td.axvline(s_us, color="#22d3ee", linewidth=0.8, alpha=0.5)
         ax_td.axvline(e_us, color="#22d3ee", linewidth=0.8, alpha=0.5)
 
+        # Symbol index label centred vertically in the body
         ax_td.text(
             (s_us + e_us) / 2, y_mid,
             f"P{si['preamble_idx']}",
@@ -355,6 +267,7 @@ def render_symbol_zoom_plot(
             fontfamily="monospace", fontweight="bold", rotation=90,
         )
 
+        # Drawing lines on the rise/fall edges
         if si["rise_us"] is not None:
             ax_td.text(
                 s_us, sig_peak - 1,
@@ -370,6 +283,7 @@ def render_symbol_zoom_plot(
                 fontfamily="monospace",
             )
 
+    # Aggregate rise/fall stats box in the top-right corner
     rise_vals = [si["rise_us"] for si in sym_infos if si["rise_us"] is not None]
     fall_vals = [si["fall_us"] for si in sym_infos if si["fall_us"] is not None]
     stats_lines = []
@@ -394,6 +308,7 @@ def render_symbol_zoom_plot(
                       edgecolor="#333", alpha=0.92),
         )
 
+    # Build panels for the spectrogram and time-domain plot, sharing the same x-axis.
     title = f"Preamble symbols {sym_offset}–{preamble_len - 1} (last {n_sym})"
     if decode_info.get("chipset"):
         title += f"  |  {decode_info['chipset']}"
@@ -406,21 +321,31 @@ def render_symbol_zoom_plot(
     ax_td.set_xlim(t_us[0], t_us[-1])
 
     ax_sg.set_facecolor("#1a1a2e")
+
+    # Window size scales with segment length so short and long captures both get
+    # reasonable time/frequency resolution. 75% overlap smooths the time axis
     nperseg_sg = min(128, n // 4) if n > 128 else max(16, n // 2)
     noverlap_sg = nperseg_sg * 3 // 4
+
+    # scipy_spectrogram slices zoom_seg into overlapping windows, FFTs each one,
+    # and returns Sxx: a 2D power grid (freq bins × time bins)
     f_sg, t_sg, Sxx = scipy_spectrogram(
         zoom_seg, fs=sr,
         nperseg=nperseg_sg, noverlap=noverlap_sg, return_onesided=False,
     )
+    # fftshift reorders bins so the FSK tone sits centred on screen instead of
+    # split across the top and bottom edges
     f_sg = np.fft.fftshift(f_sg)
     Sxx = np.fft.fftshift(Sxx, axes=0)
     Sxx_dB = 10.0 * np.log10(Sxx + 1e-12)
     t_sg_us = t_sg * 1e6
     f_sg_khz = f_sg / 1e3
 
+    # Clip colour range so a single noise spike doesn't wash out spectrogram
     plow, phigh = np.percentile(Sxx_dB, [2, 99.5])
     if phigh <= plow:
         phigh = plow + 1.0
+    # pcolormesh paints the spectrogram x=time, y=frequency, colour=power
     ax_sg.pcolormesh(t_sg_us, f_sg_khz, Sxx_dB, vmin=plow, vmax=phigh,
                      cmap="viridis", shading="auto")
     ax_sg.set_xlabel("Time (µs)", color="#ccc")
@@ -447,10 +372,13 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
     mag_dbfs = 20.0 * np.log10(np.clip(mag, 1e-12, None) / config.ADC_FULL_SCALE)
     DBFS_FLOOR = -80.0
 
-    # Envelope-based symbol edge detection
+    # Envelope-based symbol edge detection: smooth with a 0.3ms boxcar to merge
+    # intra-symbol ripple without smearing the 800us inter-symbol gaps
     win_samples = max(1, int(0.3e-3 * config.SAMPLE_RATE))
     envelope = np.convolve(mag, np.ones(win_samples) / win_samples, mode="same")
 
+    # Threshold at 40% of the noise-to-peak dynamic range so weak packets still
+    # register without false triggers from noise
     noise_floor = np.percentile(envelope, 10)
     signal_peak = np.percentile(envelope, 95)
     thresh = noise_floor + 0.4 * (signal_peak - noise_floor)
@@ -461,10 +389,13 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
     starts = np.where(edges == 1)[0]
     ends = np.where(edges == -1)[0]
 
+    # Drop glitches shorter than 2ms — real FSK symbols are 8ms
     min_sym = int(2e-3 * config.SAMPLE_RATE)
     mask = (ends - starts) >= min_sym
     starts, ends = starts[mask], ends[mask]
 
+    # Merge segments separated by less than 0.1ms; the boxcar smoothing can
+    # split a single symbol into multiple runs if there's a deep mid-symbol dip
     min_gap = int(0.1e-3 * config.SAMPLE_RATE)
     m_starts, m_ends = [], []
     for s, e in zip(starts, ends):
@@ -494,6 +425,8 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
     y_floor = max(DBFS_FLOOR, sig_peak_dbfs - 60)
     ax_td.set_ylim(y_floor, 0)
 
+    # FFT-based per-symbol tone frequency: blank the DC bin (bottom 2%) so
+    # IQ imbalance spurs don't eclipse the real FSK carrier
     sym_freqs = []
     for s, e in zip(starts, ends):
         sym_iq = iq_segment[s:e]
@@ -507,11 +440,16 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
         pk = np.argmax(psd)
         sym_freqs.append(freqs[pk])
 
+    # F0 reference: use the decoder's measured value if available (most accurate),
+    # otherwise fall back to the second detected symbol (first is the F63 preamble tone)
     if decode_info and decode_info.get("F0_hz") is not None:
         f0 = decode_info["F0_hz"]
     else:
         f0 = sym_freqs[1] if len(sym_freqs) > 1 else (sym_freqs[0] if sym_freqs else 0.0)
 
+    # Annotate each symbol: cyan shaded body + frequency label.
+    # sym[0] = F63 preamble (absolute freq); sym[1] = F0 reference;
+    # all subsequent symbols show their offset from F0 in Hz
     for i, (s, e) in enumerate(zip(starts, ends)):
         t0 = s / config.SAMPLE_RATE * 1e3
         t1 = e / config.SAMPLE_RATE * 1e3
@@ -532,11 +470,14 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
             fontfamily="monospace", fontweight="bold", rotation=90,
         )
 
+    # Red shading over inter-symbol gaps so gap width irregularities are obvious
     for i in range(len(gap_dur_ms)):
         t0 = gap_starts[i] / config.SAMPLE_RATE * 1e3
         t1 = gap_ends[i] / config.SAMPLE_RATE * 1e3
         ax_td.axvspan(t0, t1, alpha=0.12, color="#f87171")
 
+    # Stats box: symbol/gap means + std, plus cumulative drift vs expected 8.8ms slot.
+    # Drift = (actual first-to-last span) - (n_periods \u00d7 8.8ms); positive = TX clock fast
     EXPECTED_PERIOD_MS = 8.8
     lines = []
     if len(sym_dur_ms):
@@ -577,6 +518,9 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
     ax_td.grid(True, color="#333", linewidth=0.3, alpha=0.5)
     ax_td.set_xlim(t_ms[0], t_ms[-1])
 
+    # Decode info box in top-left: cyan border on success, red on failure.
+    # Shows seq number, network ID, SNR, synth resolution, header correlation,
+    # and PDU head bytes (the last, most useful for debugging a pdu_fail)
     if decode_info:
         di_lines = []
         if decode_info.get("decoded"):
@@ -623,6 +567,8 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
         )
 
     # --- Bottom: spectrogram ---
+    # fftshift reorders the one-sided FFT bins into -fs/2…+fs/2 so the
+    # FSK tone pair appears centred around baseband rather than split at edges
     ax_sg.set_facecolor("#1a1a2e")
     nperseg_td = min(256, n // 4) if n > 256 else max(16, n // 2)
     noverlap_td = nperseg_td * 3 // 4
@@ -636,6 +582,8 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
     t_sg_ms = t_sg * 1e3
     f_sg_khz = f_sg / 1e3
 
+    # Clip color range to 2nd–99.5th percentile so a single hot pixel doesn't
+    # wash out the color scale
     plow, phigh = np.percentile(Sxx_dB, [2, 99.5])
     if phigh <= plow:
         phigh = plow + 1.0
