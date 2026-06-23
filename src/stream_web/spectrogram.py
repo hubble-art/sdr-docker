@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 from scipy.signal import spectrogram as scipy_spectrogram  # noqa: E402
 
 from . import config  # noqa: E402
+from .timing import correct_symbol_edges, measure_transition_us  # noqa: E402
 
 # -- Pre-computed LUT and font ----------------------------------------------
 
@@ -175,6 +176,193 @@ def _draw_decoder_overlay(ax, decode_info: dict):
                 fontfamily="monospace", va="bottom", ha="left", alpha=1.0)
 
 
+def render_symbol_zoom_plot(
+    iq_segment: np.ndarray,
+    decode_info: dict | None = None,
+    n_symbols: int = 6,
+) -> bytes:
+    """Magnified view of the last N preamble symbols with rise/fall time annotations."""
+    if decode_info is None or decode_info.get("start_sample") is None:
+        return b""
+
+    sr = config.SAMPLE_RATE
+    sym_len = config.samples_per_symbol
+    slot = config.slot_samples[1]["slot"]
+    preamble_len = config.PREAMBLE_LEN
+
+    start_sample = decode_info["start_sample"]
+    n_sym = min(max(1, n_symbols), preamble_len)
+    # Show the last n_sym symbols
+    sym_offset = preamble_len - n_sym
+
+    first_sym_abs = start_sample + sym_offset * slot
+    last_sym_end_abs = start_sample + preamble_len * slot
+    # Half-symbol margin on each side so edge transitions aren't clipped
+    margin = sym_len // 2
+
+    view_start = max(0, first_sym_abs - margin)
+    view_end = min(len(iq_segment), last_sym_end_abs + margin)
+    if view_end <= view_start or view_end > len(iq_segment):
+        return b""
+
+    zoom_seg = iq_segment[view_start:view_end]
+    n = len(zoom_seg)
+    if n < sym_len:
+        return b""
+
+    t_us = np.arange(n) / sr * 1e6
+    mag = np.abs(zoom_seg)
+    mag_dbfs = 20.0 * np.log10(np.clip(mag, 1e-12, None) / config.ADC_FULL_SCALE)
+
+    gap_samples = slot - sym_len
+    # Half the inter-symbol gap to center selected symbols
+    meas_margin = gap_samples // 2
+
+    # Correct symbol positions using global envelope crossings + chaining
+    edges = correct_symbol_edges(
+        zoom_seg, start_sample, view_start, n_sym, sym_offset, slot, sym_len,
+    )
+
+    # Measure 10%-90% rise/fall time at each corrected edge
+    sym_infos = []
+    for k, (s, e) in enumerate(edges):
+        rise_us = measure_transition_us(zoom_seg, s - meas_margin, s + meas_margin, sr, rise=True)
+        fall_us = measure_transition_us(zoom_seg, e - meas_margin, e + meas_margin, sr, rise=False)
+        sym_infos.append({
+            "preamble_idx": sym_offset + k,
+            "s_us": s / sr * 1e6,
+            "e_us": e / sr * 1e6,
+            "rise_us": rise_us,
+            "fall_us": fall_us,
+        })
+
+    # Layout - top is envelope magnitude, bottom is spectrogram (shared x-axis)
+    fig = Figure(figsize=(12, 7), dpi=100, facecolor="#0f0f23")
+    canvas = FigureCanvasAgg(fig)
+    ax_td = fig.add_subplot(2, 1, 1)
+    ax_sg = fig.add_subplot(2, 1, 2, sharex=ax_td)
+
+    # Show symbol edges at 0.5 at 80% opacity
+    ax_td.set_facecolor("#1a1a2e")
+    ax_td.plot(t_us, mag_dbfs, color="#7fdbca", linewidth=0.5, alpha=0.8)
+
+    # Floor is about 40 dBFS below symbol.
+    sig_peak = float(np.max(mag_dbfs)) if len(mag_dbfs) else -10.0
+    y_floor = max(-80.0, sig_peak - 40.0)
+    ax_td.set_ylim(y_floor, 2.0)
+    y_mid = (sig_peak + y_floor) / 2.0
+
+    for si in sym_infos:
+        s_us, e_us = si["s_us"], si["e_us"]
+        # Shaded region shows the symbol body; vertical lines mark the edges
+        ax_td.axvspan(s_us, e_us, alpha=0.10, color="#22d3ee")
+        ax_td.axvline(s_us, color="#22d3ee", linewidth=0.8, alpha=0.5)
+        ax_td.axvline(e_us, color="#22d3ee", linewidth=0.8, alpha=0.5)
+
+        # Symbol index label centred vertically in the body
+        ax_td.text(
+            (s_us + e_us) / 2, y_mid,
+            f"P{si['preamble_idx']}",
+            ha="center", va="center", fontsize=9, color="#e2e8f0",
+            fontfamily="monospace", fontweight="bold", rotation=90,
+        )
+
+        # Drawing lines on the rise/fall edges
+        if si["rise_us"] is not None:
+            ax_td.text(
+                s_us, sig_peak - 1,
+                f"↑{si['rise_us']:.1f}µs",
+                ha="left", va="top", fontsize=7, color="#4ade80",
+                fontfamily="monospace",
+            )
+        if si["fall_us"] is not None:
+            ax_td.text(
+                e_us, sig_peak - 7,
+                f"↓{si['fall_us']:.1f}µs",
+                ha="right", va="top", fontsize=7, color="#f87171",
+                fontfamily="monospace",
+            )
+
+    # Aggregate rise/fall stats box in the top-right corner
+    rise_vals = [si["rise_us"] for si in sym_infos if si["rise_us"] is not None]
+    fall_vals = [si["fall_us"] for si in sym_infos if si["fall_us"] is not None]
+    stats_lines = []
+    if rise_vals:
+        stats_lines.append(
+            f"Rise  mean={np.mean(rise_vals):.1f}µs  "
+            f"std={np.std(rise_vals):.1f}µs  "
+            f"min={np.min(rise_vals):.1f}  max={np.max(rise_vals):.1f}"
+        )
+    if fall_vals:
+        stats_lines.append(
+            f"Fall  mean={np.mean(fall_vals):.1f}µs  "
+            f"std={np.std(fall_vals):.1f}µs  "
+            f"min={np.min(fall_vals):.1f}  max={np.max(fall_vals):.1f}"
+        )
+    if stats_lines:
+        ax_td.text(
+            0.99, 0.97, "\n".join(stats_lines), transform=ax_td.transAxes,
+            fontsize=8, color="#7fdbca", fontfamily="monospace",
+            va="top", ha="right",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="#1a1a2e",
+                      edgecolor="#333", alpha=0.92),
+        )
+
+    # Build panels for the spectrogram and time-domain plot, sharing the same x-axis.
+    title = f"Preamble symbols {sym_offset}–{preamble_len - 1} (last {n_sym})"
+    if decode_info.get("chipset"):
+        title += f"  |  {decode_info['chipset']}"
+    ax_td.set_title(title, color="#ccc", fontsize=9, fontfamily="monospace")
+    ax_td.set_ylabel("Magnitude (dBFS)", color="#ccc")
+    ax_td.tick_params(colors="#888", labelbottom=False)
+    for spine in ax_td.spines.values():
+        spine.set_color("#333")
+    ax_td.grid(True, color="#333", linewidth=0.3, alpha=0.5)
+    ax_td.set_xlim(t_us[0], t_us[-1])
+
+    ax_sg.set_facecolor("#1a1a2e")
+
+    # Window size scales with segment length so short and long captures both get
+    # reasonable time/frequency resolution. 75% overlap smooths the time axis
+    nperseg_sg = min(128, n // 4) if n > 128 else max(16, n // 2)
+    noverlap_sg = nperseg_sg * 3 // 4
+
+    # scipy_spectrogram slices zoom_seg into overlapping windows, FFTs each one,
+    # and returns Sxx: a 2D power grid (freq bins × time bins)
+    f_sg, t_sg, Sxx = scipy_spectrogram(
+        zoom_seg, fs=sr,
+        nperseg=nperseg_sg, noverlap=noverlap_sg, return_onesided=False,
+    )
+    # fftshift reorders bins so the FSK tone sits centred on screen instead of
+    # split across the top and bottom edges
+    f_sg = np.fft.fftshift(f_sg)
+    Sxx = np.fft.fftshift(Sxx, axes=0)
+    Sxx_dB = 10.0 * np.log10(Sxx + 1e-12)
+    t_sg_us = t_sg * 1e6
+    f_sg_khz = f_sg / 1e3
+
+    # Clip colour range so a single noise spike doesn't wash out spectrogram
+    plow, phigh = np.percentile(Sxx_dB, [2, 99.5])
+    if phigh <= plow:
+        phigh = plow + 1.0
+    # pcolormesh paints the spectrogram x=time, y=frequency, colour=power
+    ax_sg.pcolormesh(t_sg_us, f_sg_khz, Sxx_dB, vmin=plow, vmax=phigh,
+                     cmap="viridis", shading="auto")
+    ax_sg.set_xlabel("Time (µs)", color="#ccc")
+    ax_sg.set_ylabel("Freq (kHz)", color="#ccc")
+    ax_sg.tick_params(colors="#888")
+    for spine in ax_sg.spines.values():
+        spine.set_color("#333")
+    ax_sg.set_xlim(t_us[0], t_us[-1])
+
+    fig.tight_layout(pad=0.5)
+
+    buf = io.BytesIO()
+    canvas.print_png(buf)
+    buf.seek(0)
+    return buf.read()
+
+
 def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> bytes:
     """Render a time-domain magnitude plot + spectrogram with annotations."""
     n = len(iq_segment)
@@ -184,10 +372,13 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
     mag_dbfs = 20.0 * np.log10(np.clip(mag, 1e-12, None) / config.ADC_FULL_SCALE)
     DBFS_FLOOR = -80.0
 
-    # Envelope-based symbol edge detection
+    # Envelope-based symbol edge detection: smooth with a 0.3ms boxcar to merge
+    # intra-symbol ripple without smearing the 800us inter-symbol gaps
     win_samples = max(1, int(0.3e-3 * config.SAMPLE_RATE))
     envelope = np.convolve(mag, np.ones(win_samples) / win_samples, mode="same")
 
+    # Threshold at 40% of the noise-to-peak dynamic range so weak packets still
+    # register without false triggers from noise
     noise_floor = np.percentile(envelope, 10)
     signal_peak = np.percentile(envelope, 95)
     thresh = noise_floor + 0.4 * (signal_peak - noise_floor)
@@ -198,10 +389,13 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
     starts = np.where(edges == 1)[0]
     ends = np.where(edges == -1)[0]
 
+    # Drop glitches shorter than 2ms — real FSK symbols are 8ms
     min_sym = int(2e-3 * config.SAMPLE_RATE)
     mask = (ends - starts) >= min_sym
     starts, ends = starts[mask], ends[mask]
 
+    # Merge segments separated by less than 0.1ms; the boxcar smoothing can
+    # split a single symbol into multiple runs if there's a deep mid-symbol dip
     min_gap = int(0.1e-3 * config.SAMPLE_RATE)
     m_starts, m_ends = [], []
     for s, e in zip(starts, ends):
@@ -231,6 +425,8 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
     y_floor = max(DBFS_FLOOR, sig_peak_dbfs - 60)
     ax_td.set_ylim(y_floor, 0)
 
+    # FFT-based per-symbol tone frequency: blank the DC bin (bottom 2%) so
+    # IQ imbalance spurs don't eclipse the real FSK carrier
     sym_freqs = []
     for s, e in zip(starts, ends):
         sym_iq = iq_segment[s:e]
@@ -244,11 +440,16 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
         pk = np.argmax(psd)
         sym_freqs.append(freqs[pk])
 
+    # F0 reference: use the decoder's measured value if available (most accurate),
+    # otherwise fall back to the second detected symbol (first is the F63 preamble tone)
     if decode_info and decode_info.get("F0_hz") is not None:
         f0 = decode_info["F0_hz"]
     else:
         f0 = sym_freqs[1] if len(sym_freqs) > 1 else (sym_freqs[0] if sym_freqs else 0.0)
 
+    # Annotate each symbol: cyan shaded body + frequency label.
+    # sym[0] = F63 preamble (absolute freq); sym[1] = F0 reference;
+    # all subsequent symbols show their offset from F0 in Hz
     for i, (s, e) in enumerate(zip(starts, ends)):
         t0 = s / config.SAMPLE_RATE * 1e3
         t1 = e / config.SAMPLE_RATE * 1e3
@@ -269,11 +470,14 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
             fontfamily="monospace", fontweight="bold", rotation=90,
         )
 
+    # Red shading over inter-symbol gaps so gap width irregularities are obvious
     for i in range(len(gap_dur_ms)):
         t0 = gap_starts[i] / config.SAMPLE_RATE * 1e3
         t1 = gap_ends[i] / config.SAMPLE_RATE * 1e3
         ax_td.axvspan(t0, t1, alpha=0.12, color="#f87171")
 
+    # Stats box: symbol/gap means + std, plus cumulative drift vs expected 8.8ms slot.
+    # Drift = (actual first-to-last span) - (n_periods \u00d7 8.8ms); positive = TX clock fast
     EXPECTED_PERIOD_MS = 8.8
     lines = []
     if len(sym_dur_ms):
@@ -314,6 +518,9 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
     ax_td.grid(True, color="#333", linewidth=0.3, alpha=0.5)
     ax_td.set_xlim(t_ms[0], t_ms[-1])
 
+    # Decode info box in top-left: cyan border on success, red on failure.
+    # Shows seq number, network ID, SNR, synth resolution, header correlation,
+    # and PDU head bytes (the last, most useful for debugging a pdu_fail)
     if decode_info:
         di_lines = []
         if decode_info.get("decoded"):
@@ -360,6 +567,8 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
         )
 
     # --- Bottom: spectrogram ---
+    # fftshift reorders the one-sided FFT bins into -fs/2…+fs/2 so the
+    # FSK tone pair appears centred around baseband rather than split at edges
     ax_sg.set_facecolor("#1a1a2e")
     nperseg_td = min(256, n // 4) if n > 256 else max(16, n // 2)
     noverlap_td = nperseg_td * 3 // 4
@@ -373,6 +582,8 @@ def render_td_plot(iq_segment: np.ndarray, decode_info: dict | None = None) -> b
     t_sg_ms = t_sg * 1e3
     f_sg_khz = f_sg / 1e3
 
+    # Clip color range to 2nd–99.5th percentile so a single hot pixel doesn't
+    # wash out the color scale
     plow, phigh = np.percentile(Sxx_dB, [2, 99.5])
     if phigh <= plow:
         phigh = plow + 1.0
