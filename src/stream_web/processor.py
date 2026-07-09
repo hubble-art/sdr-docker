@@ -19,11 +19,6 @@ from . import config
 from .spectrogram import render_spec_image, render_symbol_zoom_plot, render_td_plot
 from .timing import correct_symbol_edges, edges_to_timing_stats
 
-# Two packets with the same device ID, auth tag, and payload that
-# have preambles 1s within each other are considered the same packet
-# and are de-duplicated.
-_DEDUP_START_TOL_S = 1.0
-
 
 def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
                    rx_overflows_val, rx_gain_dB_val, td_running_val,
@@ -106,7 +101,7 @@ def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
             start_t = t0 - (config.DECODE_WINDOW_S - p.get("time_s", 0.0))
             key = (p.get("ntw_id"), p.get("auth_tag"), p.get("payload_val"))
             prev = recent_decodes.get(key)
-            if prev is not None and abs(start_t - prev) < _DEDUP_START_TOL_S:
+            if prev is not None and abs(start_t - prev) < config.DEDUP_START_TOL_S:
                 continue  # same packet within the tolerance -> drop the repeat
             recent_decodes[key] = start_t
             deduped.append(p)

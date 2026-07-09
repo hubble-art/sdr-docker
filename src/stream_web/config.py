@@ -100,6 +100,10 @@ DECODE_WINDOW_S = 1.5
 DECODE_INTERVAL_S = 0.6
 DECODE_SAMPLES = int(DECODE_WINDOW_S * SAMPLE_RATE)
 
+# Two decodes of the same packet (same device id, auth tag, payload) within this window are
+# treated as one -- shared by the live processor and the offline record-analyze sweep.
+DEDUP_START_TOL_S = 1.0
+
 # -- Web server & app behaviour --------------------------------------------
 FLASK_PORT = 8050
 VERBOSE = False
@@ -118,3 +122,4 @@ _fdc.DEVICE_CHANNEL_SPACING = {
 CHANNEL_SPACING = _fdc.CHANNEL_SPACING
 DEVICE_CHANNEL_SPACING = _fdc.DEVICE_CHANNEL_SPACING
 _fdc.configure(SAMPLE_RATE)
+

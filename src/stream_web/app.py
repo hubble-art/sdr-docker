@@ -16,6 +16,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import tempfile
 import threading
 import time
 from collections import deque
@@ -26,7 +27,7 @@ from flask import Flask, Response, jsonify, render_template, send_file
 from flask import request as flask_request
 from hubble_satnet_decoder import reset_chipset_stats
 
-from . import config
+from . import analysis, config
 from .processor import processor_main
 
 # GNU Radio imports — deferred so the app can be imported without GNU Radio
@@ -464,6 +465,164 @@ def api_packets():
         }))
     payload = "\n".join(lines) + ("\n" if lines else "")
     return Response(payload, mimetype="application/x-ndjson")
+
+
+_CAPTURE_DEFAULT_SECONDS = 10
+_CAPTURE_MAX_SECONDS = 30
+
+# Only one capture may run at a time. Each holds a Flask worker for up to its full
+# duration, and concurrent captures would contend for both workers and buffer
+# bandwidth; a second request is rejected rather than queued. Shared by
+# /api/iq_capture and /api/record_analyze.
+_capture_lock = threading.Lock()
+
+
+class CaptureError(Exception):
+    """Raised by _capture_iq; carries the HTTP status the caller should return."""
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+def _samples_advanced(start: int, end: int, buf_size: int) -> int:
+    """Number of samples written from *start* to *end* in a circular buffer."""
+    if end >= start:
+        return end - start
+    return buf_size - start + end
+
+
+def _capture_iq(n_samples: int) -> np.ndarray:
+    """Capture *n_samples* of IQ forward from now out of the shared ring buffer.
+
+    Copies straight into one pre-allocated array (single copy). Raises CaptureError on
+    SDR stall (504) or if the RX laps the region mid-copy (500). Caller must hold
+    _capture_lock.
+    """
+    buf_size = config.IQ_BUFFER_SIZE
+    chunk_n = buf_size // 2
+    segment = np.empty(n_samples, dtype=np.complex64)
+    filled = 0
+    chunk_start = int(state.buf_write_idx)
+
+    while filled < n_samples:
+        this_n = min(chunk_n, n_samples - filled)
+        deadline = time.monotonic() + (this_n / config.SAMPLE_RATE) + 5.0
+
+        while _samples_advanced(chunk_start, int(state.buf_write_idx), buf_size) < this_n:
+            if time.monotonic() > deadline:
+                raise CaptureError("Timed out waiting for IQ samples from SDR", 504)
+            time.sleep(0.05)
+
+        e = (chunk_start + this_n) % buf_size
+        if chunk_start < e:
+            segment[filled:filled + this_n] = state.iq_buffer[chunk_start:e]
+        else:
+            n1 = buf_size - chunk_start
+            segment[filled:filled + n1] = state.iq_buffer[chunk_start:]
+            segment[filled + n1:filled + this_n] = state.iq_buffer[:e]
+
+        # Integrity guard: the region was read lock-free while the RX kept writing. The
+        # RX only overwrites chunk_start after lapping a full buffer past it; if the copy
+        # stalled that long, the head is now < this_n ahead (it wrapped past chunk_start)
+        # and the samples are corrupt.
+        if _samples_advanced(chunk_start, int(state.buf_write_idx), buf_size) < this_n:
+            raise CaptureError(
+                "SDR overran the capture buffer (host too slow); capture aborted", 500)
+
+        chunk_start = e
+        filled += this_n
+
+    return segment
+
+
+def _parse_seconds(default=_CAPTURE_DEFAULT_SECONDS, maximum=_CAPTURE_MAX_SECONDS):
+    """Parse/validate the 'seconds' query param.
+
+    Returns ``(seconds, None)`` on success or ``(None, (response, status))`` on error.
+    """
+    raw = flask_request.args.get("seconds")
+    if raw is None:
+        if default is not None:
+            return default, None
+        return None, (jsonify(error="'seconds' query parameter is required"), 400)
+    try:
+        seconds = int(raw)
+    except (ValueError, TypeError):
+        return None, (jsonify(error="'seconds' must be an integer"), 400)
+    if seconds < 1:
+        return None, (jsonify(error="'seconds' must be >= 1"), 400)
+    if seconds > maximum:
+        return None, (jsonify(error=f"'seconds' must be <= {maximum}"), 400)
+    return seconds, None
+
+
+@app.route("/api/iq_capture", methods=["GET"])
+def api_iq_capture():
+    seconds, err = _parse_seconds()
+    if err:
+        return err
+
+    if not _capture_lock.acquire(blocking=False):
+        return jsonify(error="Another capture is already in progress"), 409
+    try:
+        segment = _capture_iq(seconds * config.SAMPLE_RATE)
+    except CaptureError as ce:
+        return jsonify(error=str(ce)), ce.status
+    finally:
+        _capture_lock.release()
+
+    # Spill the .npy to disk past 10 MB so a large capture isn't duplicated in RAM: the
+    # segment plus its serialized bytes would otherwise roughly double peak memory
+    # (~375 MB for a 30 s capture) and can OOM small containers.
+    buf = tempfile.SpooledTemporaryFile(max_size=10 * 1024 * 1024)
+    np.save(buf, segment)
+    buf.seek(0)
+    fname = f"iq_{int(time.time())}_{seconds}s.npy"
+    resp = send_file(buf, mimetype="application/octet-stream",
+                     as_attachment=True, download_name=fname)
+    resp.headers["X-Sample-Rate-Hz"] = str(config.SAMPLE_RATE)
+    resp.headers["X-Center-Freq-Hz"] = str(int(state.lo_freq_hz))
+    resp.headers["X-Duration-S"] = str(seconds)
+    resp.headers["X-N-Samples"] = str(int(len(segment)))
+    return resp
+
+
+@app.route("/api/record_analyze", methods=["GET"])
+def api_record_analyze():
+    """Record N seconds of IQ and return a plain-text signal-diagnostic report file
+    (timing, frequency, channel hopping, amplitude) for the customer to send back."""
+    seconds, err = _parse_seconds()
+    if err:
+        return err
+
+    if not _capture_lock.acquire(blocking=False):
+        return jsonify(error="Another capture is already in progress"), 409
+    try:
+        segment = _capture_iq(seconds * config.SAMPLE_RATE)
+    except CaptureError as ce:
+        return jsonify(error=str(ce)), ce.status
+    finally:
+        _capture_lock.release()
+
+    # Analysis is CPU-only on the captured copy; the lock is already released.
+    report = analysis.analyze_recording(segment)
+    report["capture"] = {
+        "seconds": seconds,
+        "sample_rate_hz": config.SAMPLE_RATE,
+        "center_freq_hz": int(state.lo_freq_hz),
+        "n_samples": int(len(segment)),
+    }
+    text = analysis.build_report(report)
+    buf = io.BytesIO(text.encode("utf-8"))
+    buf.seek(0)
+    fname = f"sat_record_{int(time.time())}_{seconds}s.txt"
+    resp = send_file(buf, mimetype="text/plain", as_attachment=True, download_name=fname)
+    resp.headers["X-Sample-Rate-Hz"] = str(config.SAMPLE_RATE)
+    resp.headers["X-Center-Freq-Hz"] = str(int(state.lo_freq_hz))
+    resp.headers["X-Duration-S"] = str(seconds)
+    resp.headers["X-N-Samples"] = str(int(len(segment)))
+    return resp
 
 
 # ===========================================================================
