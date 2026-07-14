@@ -16,14 +16,19 @@ import numpy as np
 from hubble_satnet_decoder import compute_spec_chunk, decode_signal, get_chipset_stats
 
 from . import config
-from .spectrogram import render_spec_image, render_symbol_zoom_plot, render_td_plot
+from .spectrogram import (
+    render_spec_image,
+    render_spectrum_image,
+    render_symbol_zoom_plot,
+    render_td_plot,
+)
 from .timing import correct_symbol_edges, edges_to_timing_stats
 
 
 def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
                    rx_overflows_val, rx_gain_dB_val, td_running_val,
                    td_ntw_id_val, td_has_ntw_val, td_chipset_arr,
-                   td_zoom_n_syms_val,
+                   td_zoom_n_syms_val, view_mode_val, lo_freq_val,
                    running_event, drop_queue, result_queue):
     """Entry point for the processor process."""
 
@@ -152,11 +157,16 @@ def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
                     "chipset": det.get("chipset", "v-1"),
                 })
 
-        # 4) Render spectrogram
+        # 4) Render spectrogram (or spectrum-analyzer trace when toggled)
         t_render0 = time.perf_counter()
         img_bytes = b""
         try:
-            img_bytes = render_spec_image(list(spec_chunks), detection_history)
+            if int(view_mode_val.value) == 1:
+                img_bytes = render_spectrum_image(
+                    list(spec_chunks), lo_freq_val.value,
+                )
+            else:
+                img_bytes = render_spec_image(list(spec_chunks), detection_history)
         except Exception as e:
             print(f"[PROC] Render error: {e}")
         t_render_ms = (time.perf_counter() - t_render0) * 1000

@@ -94,6 +94,9 @@ class SharedState:
         self._td_chipset_arr = mp.Array("c", 32)
         self._td_zoom_n_syms = mp.Value("i", 6)
 
+        # main-view mode read by the processor: 0 = spectrogram, 1 = spectrum
+        self._view_mode = mp.Value("b", 0)
+
         # --- drop positions (RX→processor, lock-free via mp.Queue) ---
         self.drop_queue: mp.Queue = mp.Queue()
 
@@ -206,6 +209,14 @@ class SharedState:
     @td_zoom_n_syms.setter
     def td_zoom_n_syms(self, v: int) -> None:
         self._td_zoom_n_syms.value = max(1, min(int(v), config.PREAMBLE_LEN))
+
+    @property
+    def view_mode(self) -> str:
+        return "spectrum" if self._view_mode.value else "spectrogram"
+
+    @view_mode.setter
+    def view_mode(self, v) -> None:
+        self._view_mode.value = 1 if v in (1, "spectrum", True) else 0
 
     # legacy compat — RX pushes drop positions via queue now
     @property
@@ -326,6 +337,7 @@ def api_status():
             chipset_stats=cs_stats,
             known_chipsets=sorted(config.SYNTH_RES.keys()),
             lo_freq_hz=state.lo_freq_hz,
+            view_mode=state.view_mode,
         )
 
 
@@ -351,6 +363,21 @@ def api_gain():
     new_gain = int(max(config.RX_GAIN_MIN_DB, min(config.RX_GAIN_MAX_DB, new_gain)))
     state.rx_gain_dB = new_gain
     return jsonify(gain=new_gain)
+
+
+@app.route("/api/view", methods=["GET", "POST"])
+def api_view():
+    """Toggle the main display between spectrogram and spectrum-analyzer view."""
+    if flask_request.method == "POST":
+        data = flask_request.get_json(silent=True) or {}
+        mode = data.get("mode")
+        if mode is None:
+            # No explicit mode -> flip the current one.
+            mode = "spectrogram" if state.view_mode == "spectrum" else "spectrum"
+        if mode not in ("spectrogram", "spectrum"):
+            return jsonify(error="mode must be 'spectrogram' or 'spectrum'"), 400
+        state.view_mode = mode
+    return jsonify(view_mode=state.view_mode)
 
 
 @app.route("/api/lo", methods=["POST"])
@@ -884,6 +911,8 @@ def main():
                 state._td_has_ntw_id,
                 state._td_chipset_arr,
                 state._td_zoom_n_syms,
+                state._view_mode,
+                state._lo_freq_hz,
                 state.running,
                 state.drop_queue,
                 state.result_queue,
